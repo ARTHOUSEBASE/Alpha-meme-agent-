@@ -1,0 +1,13 @@
+{
+  "name": "alpha-meme-agent",
+  "version": "1.0.0",
+  "description": "AI agent for meme coin trading",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": "18.x"
+  }
+}
