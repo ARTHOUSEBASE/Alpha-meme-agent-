@@ -1,13 +1,15 @@
 /**
- * Alpha Meme AI Agent
- * Autonomous Meme Coin Trading Agent
+ * Alpha Meme AI Agent - Railway Deploy
  * Wallet: 0x9C67140AdE64577ef6B40BeA6a801aDf1555a5E8
+ * 
+ * API Bankr: https://api.bankr.bot
+ * API Clanker (via Bitquery): https://streaming.bitquery.io/graphql
  */
 
 const http = require('http');
 const url = require('url');
 
-// Config from environment variables
+// Config
 const CONFIG = {
   WALLET: '0x9C67140AdE64577ef6B40BeA6a801aDf1555a5E8',
   PRIVATE_KEY: process.env.PRIVATE_KEY,
@@ -15,100 +17,262 @@ const CONFIG = {
   BITQUERY_API_KEY: process.env.BITQUERY_API_KEY,
 };
 
-// In-memory storage (gunakan database untuk production)
+// Storage
 const positions = new Map();
-const scannedTokens = [];
 
-// Scan meme tokens dari Clanker
-async function scanTokens() {
-  const query = {
-    query: `{
-      EVM(network: base) {
-        Events(
-          where: {
-            Log: { Signature: { Name: { is: "TokenCreated" } } }
-            LogHeader: { Address: { is: "0x375C15db32D28cEcdcAB5C03Ab889bf15cbD2c5E" } }
-          }
-          limit: 10
-          orderBy: { descending: Block_Time }
-        ) {
-          Arguments {
-            Name
-            Value {
-              ... on EVM_ABI_Address_Value_Arg { address }
-              ... on EVM_ABI_String_Value_Arg { string }
-            }
-          }
-          Block { Time }
-          Transaction { From }
-        }
-      }
-    }`
-  };
+// ==========================================
+// BANKR API - Trading Execution
+// ==========================================
 
-  try {
-    const res = await fetch('https://streaming.bitquery.io/graphql', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': process.env.BITQUERY_API_KEY,
-      },
-      body: JSON.stringify(query),
-    });
-
-    const data = await res.json();
-    const events = data.data?.EVM?.Events || [];
-    
-    const tokens = events.map(e => ({
-      address: e.Arguments.find(a => a.Name === 'tokenAddress')?.Value?.address,
-      name: e.Arguments.find(a => a.Name === 'name')?.Value?.string,
-      symbol: e.Arguments.find(a => a.Name === 'symbol')?.Value?.string,
-      deployer: e.Transaction.From,
-      created: e.Block.Time,
-    })).filter(t => t.address);
-
-    scannedTokens.push(...tokens);
-    return tokens;
-  } catch (e) {
-    console.error('Scan error:', e);
-    return [];
-  }
-}
-
-// Execute trade via Bankr API
-async function executeTrade(token, action, amount = '0.01') {
+/**
+ * Execute trade via Bankr Agent API
+ * POST https://api.bankr.bot/agent/prompt
+ */
+async function bankrTrade(token, action, amount = '0.01') {
   const res = await fetch('https://api.bankr.bot/agent/prompt', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-API-Key': process.env.BANKR_API_KEY,
+      'X-API-Key': CONFIG.BANKR_API_KEY,
     },
     body: JSON.stringify({
       prompt: `${action} ${amount} ETH of ${token} on Base with 2% slippage`,
     }),
   });
+  
+  if (!res.ok) throw new Error(`Bankr API error: ${res.status}`);
   return res.json();
 }
 
-// Calculate smart money score (simplified)
-function calculateScore(token) {
-  // Mock scoring - ganti dengan real analysis
-  const age = Date.now() - new Date(token.created).getTime();
-  const ageScore = age < 3600000 ? 0.9 : age < 7200000 ? 0.7 : 0.5; // <1h = 0.9, <2h = 0.7
+/**
+ * Check job status
+ * GET https://api.bankr.bot/agent/job/{jobId}
+ */
+async function checkBankrJob(jobId) {
+  const res = await fetch(`https://api.bankr.bot/agent/job/${jobId}`, {
+    headers: {
+      'X-API-Key': CONFIG.BANKR_API_KEY,
+    },
+  });
+  return res.json();
+}
+
+// ==========================================
+// CLANKER API - Via Bitquery (GraphQL)
+// ==========================================
+
+/**
+ * Scan Clanker tokens via Bitquery
+ * Query Clanker deployer contract: 0x375C15db32D28cEcdcAB5C03Ab889bf15cbD2c5E
+ */
+async function scanClankerTokens() {
+  const query = {
+    query: `
+      query {
+        EVM(network: base) {
+          Events(
+            where: {
+              Log: { Signature: { Name: { is: "TokenCreated" } } }
+              LogHeader: { Address: { is: "0x375C15db32D28cEcdcAB5C03Ab889bf15cbD2c5E" } }
+            }
+            limit: 10
+            orderBy: { descending: Block_Time }
+          ) {
+            Arguments {
+              Name
+              Value {
+                ... on EVM_ABI_Address_Value_Arg { address }
+                ... on EVM_ABI_String_Value_Arg { string }
+                ... on EVM_ABI_BigInt_Value_Arg { bigInteger }
+              }
+            }
+            Block { Time }
+            Transaction { From }
+          }
+        }
+      }
+    `
+  };
+
+  const res = await fetch('https://streaming.bitquery.io/graphql', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-KEY': CONFIG.BITQUERY_API_KEY,
+    },
+    body: JSON.stringify(query),
+  });
+
+  const data = await res.json();
+  const events = data.data?.EVM?.Events || [];
+  
+  return events.map(e => ({
+    address: e.Arguments.find(a => a.Name === 'tokenAddress')?.Value?.address,
+    name: e.Arguments.find(a => a.Name === 'name')?.Value?.string,
+    symbol: e.Arguments.find(a => a.Name === 'symbol')?.Value?.string,
+    supply: e.Arguments.find(a => a.Name === 'maxSupply')?.Value?.bigInteger,
+    deployer: e.Transaction.From,
+    createdAt: e.Block.Time,
+  })).filter(t => t.address);
+}
+
+/**
+ * Get token liquidity & volume (Bitquery)
+ */
+async function getTokenMetrics(tokenAddress) {
+  const query = {
+    query: `
+      query {
+        EVM(network: base) {
+          DEXTrades(
+            where: {
+              Trade: { Currency: { SmartContract: { is: "${tokenAddress}" } } }
+              Block: { Time: { since: "24 hours ago" } }
+            }
+          ) {
+            Trade {
+              AmountInUSD
+              Side { Type }
+            }
+          }
+        }
+      }
+    `
+  };
+
+  const res = await fetch('https://streaming.bitquery.io/graphql', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-KEY': CONFIG.BITQUERY_API_KEY,
+    },
+    body: JSON.stringify(query),
+  });
+
+  const data = await res.json();
+  const trades = data.data?.EVM?.DEXTrades || [];
+  
+  const volume = trades.reduce((sum, t) => sum + parseFloat(t.Trade.AmountInUSD || 0), 0);
+  const buys = trades.filter(t => t.Trade.Side?.Type === 'Buy').length;
+  const sells = trades.filter(t => t.Trade.Side?.Type === 'Sell').length;
   
   return {
-    confidence: ageScore,
-    smartScore: 0.6,
-    narrativeScore: ageScore,
+    volume24h: volume,
+    buyPressure: buys / (buys + sells) || 0.5,
+    tradeCount: trades.length,
   };
 }
 
-// HTTP Server
+// ==========================================
+// SMART MONEY ANALYSIS
+// ==========================================
+
+async function analyzeSmartMoney(tokenAddress) {
+  const query = {
+    query: `
+      query {
+        EVM(network: base) {
+          DEXTrades(
+            where: {
+              Trade: { 
+                Currency: { SmartContract: { is: "${tokenAddress}" } }
+                AmountInUSD: { gt: "1000" }
+              }
+              Block: { Time: { since: "6 hours ago" } }
+            }
+            orderBy: { descending: Block_Time }
+            limit: 50
+          ) {
+            Trade {
+              Buyer
+              Seller
+              AmountInUSD
+              Side { Type }
+            }
+          }
+        }
+      }
+    `
+  };
+
+  const res = await fetch('https://streaming.bitquery.io/graphql', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-KEY': CONFIG.BITQUERY_API_KEY,
+    },
+    body: JSON.stringify(query),
+  });
+
+  const data = await res.json();
+  const trades = data.data?.EVM?.DEXTrades || [];
+  
+  // Analyze whale activity
+  const whaleBuys = trades.filter(t => t.Trade.Side?.Type === 'Buy' && parseFloat(t.Trade.AmountInUSD) > 5000);
+  const whaleSells = trades.filter(t => t.Trade.Side?.Type === 'Sell' && parseFloat(t.Trade.AmountInUSD) > 5000);
+  
+  const buyVolume = whaleBuys.reduce((sum, t) => sum + parseFloat(t.Trade.AmountInUSD), 0);
+  const sellVolume = whaleSells.reduce((sum, t) => sum + parseFloat(t.Trade.AmountInUSD), 0);
+  
+  const netFlow = buyVolume - sellVolume;
+  const score = Math.min(Math.max((netFlow / 10000) + 0.5, 0), 1); // 0-1 scale
+  
+  return {
+    score,
+    whaleBuys: whaleBuys.length,
+    whaleSells: whaleSells.length,
+    netFlow,
+    activity: trades.length,
+  };
+}
+
+// ==========================================
+// TRADING ENGINE
+// ==========================================
+
+async function scanOpportunities() {
+  const tokens = await scanClankerTokens();
+  const opportunities = [];
+  
+  for (const token of tokens.slice(0, 5)) { // Analyze top 5
+    try {
+      const [metrics, smartMoney] = await Promise.all([
+        getTokenMetrics(token.address),
+        analyzeSmartMoney(token.address),
+      ]);
+      
+      const age = Date.now() - new Date(token.createdAt).getTime();
+      const ageScore = age < 3600000 ? 0.9 : age < 7200000 ? 0.7 : 0.4;
+      const volumeScore = Math.min(metrics.volume24h / 50000, 1) * 0.3;
+      const smartScore = smartMoney.score * 0.4;
+      const momentumScore = metrics.buyPressure * 0.3;
+      
+      const confidence = (ageScore * 0.3) + volumeScore + smartScore + momentumScore;
+      
+      opportunities.push({
+        ...token,
+        metrics,
+        smartMoney,
+        confidence: Math.min(confidence, 1),
+        age: Math.floor(age / 60000) + 'm',
+      });
+    } catch (e) {
+      console.error(`Error analyzing ${token.symbol}:`, e.message);
+    }
+  }
+  
+  return opportunities.sort((a, b) => b.confidence - a.confidence);
+}
+
+// ==========================================
+// HTTP SERVER
+// ==========================================
+
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const path = parsedUrl.pathname;
   
-  // CORS headers
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -122,90 +286,98 @@ const server = http.createServer(async (req, res) => {
   let body = '';
   req.on('data', chunk => body += chunk);
   await new Promise(resolve => req.on('end', resolve));
-
   const jsonBody = body ? JSON.parse(body) : {};
 
-  // Health check
-  if (path === '/health' || path === '/') {
+  // Health
+  if (path === '/' || path === '/health') {
     return res.end(JSON.stringify({
       status: 'operational',
       agent: 'Alpha Meme',
       version: '1.0.0',
       wallet: CONFIG.WALLET,
+      apis: {
+        bankr: 'https://api.bankr.bot',
+        clanker: 'https://streaming.bitquery.io/graphql (Bitquery)',
+      },
       timestamp: new Date().toISOString(),
     }));
   }
 
-  // Skill manifest untuk OpenAgent Market
+  // Skill Manifest
   if (path === '/skill' || path === '/skill.md') {
     return res.end(JSON.stringify({
       name: 'Alpha Meme',
-      description: 'AI agent for autonomous meme coin trading with smart money tracking, narrative momentum analysis, and copy-trading on Base blockchain',
+      description: 'AI agent for autonomous meme coin trading with smart money tracking via Bankr API and Clanker data via Bitquery',
       version: '1.0.0',
       wallet: CONFIG.WALLET,
       category: 'trading',
-      tags: ['meme', 'trading', 'base', 'ai', 'smart-money', 'copy-trading'],
+      tags: ['meme', 'trading', 'base', 'ai', 'smart-money', 'clanker', 'bankr'],
       skills: [
         {
           name: 'scan_opportunities',
-          description: 'Scan for high-confidence meme coin opportunities',
-          parameters: { minConfidence: { type: 'number', default: 0.7 } },
-          pricing: { amount: '0.001', currency: 'ETH' }
+          description: 'Scan Clanker tokens with smart money analysis',
+          pricing: { amount: '0.001', currency: 'ETH' },
         },
         {
           name: 'execute_trade',
-          description: 'Execute buy or sell trade on Base',
+          description: 'Execute buy/sell via Bankr API',
           parameters: {
             token: { type: 'string', required: true },
             action: { type: 'string', enum: ['buy', 'sell'], required: true },
-            amount: { type: 'string', default: '0.01' }
+            amount: { type: 'string', default: '0.01' },
           },
-          pricing: { amount: '0.005', currency: 'ETH' }
+          pricing: { amount: '0.005', currency: 'ETH' },
         },
         {
-          name: 'get_portfolio',
-          description: 'Get current portfolio and positions',
-          parameters: {},
-          pricing: { amount: '0', currency: 'ETH' }
-        }
+          name: 'analyze_token',
+          description: 'Deep analysis of specific token',
+          pricing: { amount: '0.002', currency: 'ETH' },
+        },
       ],
       endpoints: {
         health: '/health',
         skill: '/skill',
         scan: '/scan',
         trade: '/trade',
-        portfolio: '/portfolio'
-      }
+        analyze: '/analyze',
+        portfolio: '/portfolio',
+      },
     }, null, 2));
   }
 
-  // Scan tokens
+  // Scan opportunities
   if (path === '/scan') {
-    const tokens = await scanTokens();
-    const scored = tokens.map(t => ({
-      ...t,
-      ...calculateScore(t),
-      age: Math.floor((Date.now() - new Date(t.created).getTime()) / 60000) + 'm ago'
-    })).sort((a, b) => b.confidence - a.confidence);
-
-    return res.end(JSON.stringify({
-      count: scored.length,
-      opportunities: scored.filter(t => t.confidence > 0.7),
-      tokens: scored
-    }));
+    try {
+      const opportunities = await scanOpportunities();
+      return res.end(JSON.stringify({
+        count: opportunities.length,
+        opportunities: opportunities.map(o => ({
+          address: o.address,
+          symbol: o.symbol,
+          name: o.name,
+          confidence: o.confidence.toFixed(2),
+          smartScore: o.smartMoney.score.toFixed(2),
+          volume24h: o.metrics.volume24h.toFixed(2),
+          age: o.age,
+        })),
+      }));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ error: e.message }));
+    }
   }
 
-  // Execute trade
+  // Execute trade via Bankr
   if (path === '/trade' && req.method === 'POST') {
     const { token, action, amount } = jsonBody;
     
     if (!token || !action) {
       res.writeHead(400);
-      return res.end(JSON.stringify({ error: 'Missing token or action' }));
+      return res.end(JSON.stringify({ error: 'Need token and action' }));
     }
 
     try {
-      const result = await executeTrade(token, action, amount);
+      const result = await bankrTrade(token, action, amount);
       
       if (action === 'buy' && result.jobId) {
         positions.set(token, {
@@ -214,15 +386,16 @@ const server = http.createServer(async (req, res) => {
           amount: amount || '0.01',
           entry: Date.now(),
           jobId: result.jobId,
-          status: 'pending'
+          status: 'pending',
         });
       }
 
       return res.end(JSON.stringify({
-        success: !!result.jobId,
+        success: true,
         jobId: result.jobId,
         status: result.status,
-        message: `${action} ${amount || '0.01'} ETH of ${token}`
+        message: `${action} ${amount || '0.01'} ETH of ${token}`,
+        checkStatus: `/job/${result.jobId}`,
       }));
     } catch (e) {
       res.writeHead(500);
@@ -230,49 +403,94 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Get portfolio
+  // Check job status
+  if (path.startsWith('/job/')) {
+    const jobId = path.split('/')[2];
+    try {
+      const status = await checkBankrJob(jobId);
+      return res.end(JSON.stringify(status));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ error: e.message }));
+    }
+  }
+
+  // Analyze specific token
+  if (path === '/analyze' && req.method === 'POST') {
+    const { token } = jsonBody;
+    if (!token) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: 'Need token address' }));
+    }
+
+    try {
+      const [metrics, smartMoney] = await Promise.all([
+        getTokenMetrics(token),
+        analyzeSmartMoney(token),
+      ]);
+
+      return res.end(JSON.stringify({
+        token,
+        metrics,
+        smartMoney,
+        recommendation: smartMoney.score > 0.7 ? 'STRONG_BUY' : 
+                       smartMoney.score > 0.5 ? 'BUY' : 'HOLD',
+      }));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ error: e.message }));
+    }
+  }
+
+  // Portfolio
   if (path === '/portfolio') {
     return res.end(JSON.stringify({
       wallet: CONFIG.WALLET,
-      totalPositions: positions.size,
       positions: Array.from(positions.values()),
-      scannedHistory: scannedTokens.length
+      totalPositions: positions.size,
     }));
   }
 
-  // Auto-trading endpoint (cron job)
+  // Auto-trade (cron endpoint)
   if (path === '/auto') {
-    const tokens = await scanTokens();
-    const highConfidence = tokens
-      .map(t => ({ ...t, ...calculateScore(t) }))
-      .filter(t => t.confidence > 0.85)
-      .slice(0, 2); // Max 2 trades
+    try {
+      const opportunities = await scanOpportunities();
+      const highConfidence = opportunities.filter(o => o.confidence > 0.8).slice(0, 2);
+      
+      const results = [];
+      for (const opp of highConfidence) {
+        const result = await bankrTrade(opp.address, 'buy', '0.01');
+        results.push({
+          token: opp.symbol,
+          address: opp.address,
+          confidence: opp.confidence,
+          jobId: result.jobId,
+        });
+      }
 
-    const results = [];
-    for (const token of highConfidence) {
-      const result = await executeTrade(token.address, 'buy', '0.01');
-      results.push({
-        token: token.symbol,
-        address: token.address,
-        confidence: token.confidence,
-        jobId: result.jobId
-      });
+      return res.end(JSON.stringify({
+        autoTraded: results.length,
+        results,
+        scanned: opportunities.length,
+      }));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ error: e.message }));
     }
-
-    return res.end(JSON.stringify({
-      autoTraded: results.length,
-      results,
-      message: 'Auto-scan and trade completed'
-    }));
   }
 
   // 404
   res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found', path }));
+  res.end(JSON.stringify({ 
+    error: 'Not found',
+    available: ['/health', '/skill', '/scan', '/trade', '/analyze', '/portfolio', '/auto', '/job/:id'],
+  }));
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Alpha Meme Agent running on port ${PORT}`);
   console.log(`💰 Wallet: ${CONFIG.WALLET}`);
+  console.log(`🔗 Bankr API: https://api.bankr.bot`);
+  console.log(`📊 Clanker/Bitquery: https://streaming.bitquery.io/graphql`);
 });
