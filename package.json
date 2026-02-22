@@ -1,6 +1,12 @@
 {
   "name": "alpha-meme-agent",
   "version": "1.0.0",
+  "description": "Alpha Meme AI Agent with Dashboard",
   "main": "index.js",
-  "scripts": { "start": "node index.js" }
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": "18.x"
+  }
 }
